@@ -1,0 +1,154 @@
+import { config } from '../config/env';
+import { logger } from '../utils/logger';
+import { UserRecord } from '../parser/csvParser';
+
+// ─── Rotation pools ───────────────────────────────────────────────────────────
+
+const SUBJECT_STYLES = [
+  (name: string) => `${name}, today is the last day — just try it`,
+  (name: string) => `${name}, your subscription expires today`,
+  (name: string) => `${name}, this is my last message about this`,
+  (name: string) => `${name}, one last thing before your subscription ends`,
+  (name: string) => `${name}, closing the loop on this`,
+  (name: string) => `${name}, last chance — expires today`,
+  (name: string) => `${name}, final note before your renewal`,
+  (name: string) => `${name}, wrapping up — today's the day`,
+];
+
+const OPENING_LINES = [
+  "I've reached out a couple of times this week — today is genuinely the last day your current subscription is active.",
+  "This is my third and final message. I only kept following up because I genuinely think this matters for you today.",
+  "I promised myself I'd only send one more — and today's the day your subscription actually expires, so here it is.",
+  "Last one, I promise. I've sent a couple of notes this week, and today is the actual expiry date.",
+  "I don't want to clutter your inbox — but today is the last day, and I'd feel bad not mentioning it one more time.",
+  "Final message from me. Your subscription ends today, and I wanted to make sure you had this before it did.",
+  "I know I've reached out before — this is the last time. Today your current tool's subscription expires.",
+  "One last note. I've followed up because today is genuinely the final day of your subscription.",
+];
+
+const MIDDLE_LINES = [
+  "Your ArtNovaAI account is ready and waiting — just log in, use your 2 free credits, and see what 4–5 second generation actually feels like before you decide anything.",
+  "You already have an account. No setup. No card. Just 2 free credits sitting there — takes 60 seconds to use them before your subscription closes out.",
+  "The account is set up. The credits are there. All you have to do is log in once and run one image — before the clock runs out today.",
+  "Before your subscription lapses — you have 2 free credits on ArtNovaAI, no setup needed. Log in and use them. That's it.",
+  "It costs you nothing to try. Your ArtNovaAI account already exists with 2 free credits. One login. One image. Sixty seconds.",
+  "Your ArtNovaAI account has been ready since day one. Two free credits. No commitment. Just use them today before your current tool auto-renews or expires.",
+];
+
+const COMPARISON_LINES = [
+  'Same results. A fraction of the cost. No renewal fees.',
+  'Faster generation, lower price — no lock-in, no auto-renewal.',
+  '4–5 seconds per image. Cheaper than what you\'re paying now. No strings.',
+  'Professional quality. 4–5 second turnaround. None of the renewal headaches.',
+  'Same output quality. Dramatically faster. Nothing to renew.',
+  'Better speed, better price — and you already have access.',
+];
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function pick<T>(arr: T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function firstName(fullName: string): string {
+  return fullName.trim().split(/\s+/)[0];
+}
+
+// ─── LLM-based generation ─────────────────────────────────────────────────────
+
+async function generateEmailWithLLM(
+  user: UserRecord,
+  customPrompt: string
+): Promise<{ subject: string; body: string }> {
+  const first = firstName(user.name);
+
+  const systemMessage = `You are an email copywriter for ${config.brandName} (${config.brandUrl}), a fast AI image generation tool. The sender is ${config.senderName} from ${config.brandName}.
+
+Write a short, personal, plain-text email (no HTML, no markdown formatting, no bullet points) based on the instructions given. Keep it concise (under 120 words). Use \\n\\n between paragraphs. Sign off as "${config.senderName}\\n${config.brandName} Team".
+
+Return ONLY valid JSON with this exact shape: {"subject": "...", "body": "..."}
+Do not include any text before or after the JSON.`;
+
+  const userMessage = `${customPrompt}\n\nRecipient name: ${first}\nRecipient email: ${user.email}`;
+
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${config.llmApiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: systemMessage },
+        { role: 'user', content: userMessage },
+      ],
+      temperature: 0.8,
+      max_tokens: 500,
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Groq API error: ${response.status} ${err}`);
+  }
+
+  const data = await response.json() as { choices: Array<{ message: { content: string } }> };
+  const content: string = data.choices[0].message.content.trim();
+
+  // Extract JSON — handle case where model wraps in markdown code fences
+  const jsonMatch = content.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error('LLM did not return valid JSON');
+
+  return JSON.parse(jsonMatch[0]) as { subject: string; body: string };
+}
+
+// ─── Main export ──────────────────────────────────────────────────────────────
+
+/**
+ * Generate an email by either:
+ * - Calling the LLM (Groq) when a customPrompt is provided, OR
+ * - Assembling from curated rotation pools (default)
+ */
+export async function generateEmail(
+  user: UserRecord,
+  customPrompt?: string
+): Promise<{ subject: string; body: string }> {
+  try {
+    if (customPrompt && customPrompt.trim()) {
+      return await generateEmailWithLLM(user, customPrompt.trim());
+    }
+
+    const first = firstName(user.name);
+
+    const subject = pick(SUBJECT_STYLES)(first);
+    const opening = pick(OPENING_LINES);
+    const middle = pick(MIDDLE_LINES);
+    const comparison = pick(COMPARISON_LINES);
+    const url = config.brandUrl;
+
+    // Build body directly — no LLM, guaranteed blank lines between paragraphs
+    const body = [
+      `Hi ${first},`,
+      opening,
+      middle,
+      comparison,
+      `This is the last nudge, I promise: ${url}`,
+      'Warm regards,\nAayushi\nArtNovaAI Team',
+    ].join('\n\n');
+
+    return { subject, body };
+  } catch (error) {
+    logger.error(
+      `Failed to generate email for ${user.email}: ${error instanceof Error ? error.message : String(error)}`
+    );
+    throw error;
+  }
+}
+
+/**
+ * Add delay to respect API rate limits
+ */
+export async function rateLimit(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 3 * 60 * 1000));
+}
