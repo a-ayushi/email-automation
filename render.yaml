@@ -3,14 +3,13 @@ services:
     name: email-outreach
     env: node
     plan: free
-    buildCommand: npm install --no-cache && npm run build
+    nodeVersion: "20"
+    buildCommand: npm ci --no-audit --no-fund && npm run build:backend
     startCommand: node dist/backend/server.js
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 3000
-      - key: NPM_FLAGS
-        value: --legacy-peer-deps
       - key: NODE_OPTIONS
         value: --max-old-space-size=2048
